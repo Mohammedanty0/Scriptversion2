@@ -56,6 +56,64 @@ FEW_THRESHOLD = 20
 LIMITED_BUY_QTY = 15
 GAS_LIMIT_SAFETY_MARGIN = 1.2
 
+# ---------------------------------------------------------------------------
+# فك ترميز أخطاء العقد (Custom Errors) بدل عرض hex خام غير مقروء
+# ---------------------------------------------------------------------------
+
+# التوقيعات مأخوذة من الكود المصدري الرسمي لـ SeaDrop (ProjectOpenSea/seadrop)
+SEADROP_ERROR_SIGNATURES = {
+    "MintQuantityCannotBeZero()": "الكمية المطلوبة صفر",
+    "MintQuantityExceedsMaxMintedPerWallet(uint256,uint256)": "تجاوزت الكمية الحد المسموح لهذه المحفظة",
+    "MintQuantityExceedsMaxSupply(uint256,uint256)": "نفدت الكمية المتاحة (Max Supply)",
+    "MintQuantityExceedsMaxTokenSupplyForStage(uint256,uint256)": "نفدت الكمية المتاحة لهذه المرحلة",
+    "NotActive(uint256,uint256,uint256)": "المرحلة غير نشطة حاليًا (لم تبدأ أو انتهت)",
+    "IncorrectPayment(uint256,uint256)": "قيمة الدفع المُرسلة غير صحيحة",
+    "PublicDropStageNotPresent()": "لا توجد مرحلة عامة (Public Drop) لهذا العقد",
+}
+
+
+def _build_selector_map() -> dict:
+    mapping = {}
+    for sig, arabic in SEADROP_ERROR_SIGNATURES.items():
+        try:
+            selector = Web3.keccak(text=sig)[:4].hex()
+            if not selector.startswith("0x"):
+                selector = "0x" + selector
+            mapping[selector.lower()] = (sig, arabic)
+        except Exception:
+            pass
+    return mapping
+
+
+SEADROP_ERROR_SELECTORS = _build_selector_map()
+
+
+def decode_web3_error(e: Exception) -> str:
+    """يحاول تحويل استثناء web3/RPC غير المقروء إلى رسالة عربية مختصرة ومفهومة."""
+    import re
+
+    # الحالة 1: استثناء JSON-RPC عادي يحمل dict فيه 'message' (الأشيع لأخطاء الشبكة/الرصيد)
+    if e.args and isinstance(e.args[0], dict):
+        msg = e.args[0].get("message")
+        if msg:
+            return str(msg)[:200]
+
+    text = str(e)
+
+    # الحالة 2: مطابقة أول 4 بايت من أي بيانات hex ضد أخطاء SeaDrop المعروفة
+    match = re.search(r"0x[0-9a-fA-F]{8,}", text)
+    if match:
+        hex_data = match.group(0).lower()
+        selector = hex_data[:10]
+        known = SEADROP_ERROR_SELECTORS.get(selector)
+        if known:
+            return f"رفض من العقد: {known[1]}"
+        short = hex_data[:14] + ("…" if len(hex_data) > 14 else "")
+        return f"رفض من العقد (سبب غير معروف لدينا، selector: {short})"
+
+    # الحالة 3: أي نص آخر — يُقصّ لتفادي إغراق اللوج
+    return text[:200]
+
 # قفل خاص لكل محفظة لمنع تضارب المعاملات والنونس في نفس الوقت
 wallet_locks = {}
 
@@ -190,8 +248,9 @@ def attempt_purchase_single_wallet(
             estimated_gas = w3.eth.estimate_gas(tx)
             tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
         except Exception as e:
-            log.warning(f"[{slug} | {checksum_wallet[:8]}] ⏭️ فشلت محاكاة المعاملة (على الأغلب مرفوضة من العقد): {e}")
-            return {"success": False, "wallet": checksum_wallet, "reason": "simulation_failed", "error": str(e)}
+            readable = decode_web3_error(e)
+            log.warning(f"[{slug} | {checksum_wallet[:8]}] ⏭️ فشلت محاكاة المعاملة: {readable}")
+            return {"success": False, "wallet": checksum_wallet, "reason": "simulation_failed", "error": readable}
 
         actual_gas_fee_usd = (tx["gas"] * w3.eth.gas_price / 1e18) * eth_price_usd
         if actual_gas_fee_usd > max_gas_fee_usd:
@@ -224,6 +283,7 @@ def attempt_purchase_single_wallet(
         }
 
     except Exception as e:
-        log.error(f"[{slug} | خطأ إرسال للمحفظة {checksum_wallet[:8]}] {e}")
-        return {"success": False, "wallet": checksum_wallet, "reason": "tx_error", "error": str(e)}
+        readable = decode_web3_error(e)
+        log.error(f"[{slug} | خطأ إرسال للمحفظة {checksum_wallet[:8]}] {readable}")
+        return {"success": False, "wallet": checksum_wallet, "reason": "tx_error", "error": readable}
 
