@@ -73,7 +73,7 @@ CHAIN_CONFIGS = {
     "robinhood": {
         "stream_chain_name": "robinhood",
         "rpc_url": f"https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY_ROBINHOOD}",
-        "max_gas_fee_usd": 0.20,
+        "max_gas_fee_usd": 0.05,
     },
     "ethereum": {
         "stream_chain_name": "ethereum",
@@ -238,6 +238,48 @@ def build_gaveup_message(detail: dict, reason: str) -> str:
     return f"❌ <b>انتهت الفرصة</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason}"
 
 
+FAILURE_REASON_LABELS = {
+    "balance_too_low": "رصيد غير كافٍ",
+    "gas_too_high": "رسوم الغاز أعلى من الحد المسموح",
+    "no_fee_recipient": "تعذر جلب عنوان الرسوم من العقد",
+    "simulation_failed": "رفضت محاكاة المعاملة",
+    "insufficient_funds_for_total_cost": "الرصيد لا يغطي (السعر + الغاز)",
+    "tx_error": "خطأ عند إرسال المعاملة",
+    "invalid_address": "عنوان محفظة غير صالح",
+    "already_bought": "تم الشراء مسبقًا لهذه المحفظة",
+    "sold_out": "نفدت الكمية",
+    "no_contract_address": "لا يوجد عنوان عقد لهذه المجموعة",
+    "all_wallets_completed": "كل المحافظ اشترت مسبقًا",
+}
+
+
+def build_purchase_summary_message(detail: dict, results: list[dict]) -> str:
+    """رسالة واحدة موحّدة تلخص نتيجة محاولة الشراء لكل المحافظ، تُرسَل مرة واحدة بعد انتهاء المحاولة."""
+    name = detail.get("collection_name") or detail.get("collection_slug")
+    url = detail.get("opensea_url", "")
+    total = len(results)
+    successes = [r for r in results if r.get("success")]
+    failures = [r for r in results if not r.get("success")]
+
+    lines = [
+        "🛒 <b>نتيجة محاولة الشراء</b>",
+        f"المجموعة: <b>{name}</b>",
+        f"النتيجة: {len(successes)} نجاح / {len(failures)} فشل (من أصل {total})",
+    ]
+    if failures:
+        lines.append("\nأسباب الفشل:")
+        for r in failures:
+            wallet_short = (r.get("wallet") or "?")[:8]
+            reason_key = r.get("reason")
+            reason_label = FAILURE_REASON_LABELS.get(reason_key, reason_key or "غير معروف")
+            error_detail = r.get("error")
+            extra = f" — {error_detail}" if error_detail and reason_key in ("tx_error", "simulation_failed") else ""
+            lines.append(f"• <code>{wallet_short}</code>: {reason_label}{extra}")
+    if url:
+        lines.append(f"\n🔗 {url}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # الشراء المتوازي وتوزيع الإشعارات على البوتات الخاصة
 # ---------------------------------------------------------------------------
@@ -380,7 +422,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
 
         log.info(f"✅ '{slug}': يوجد حساب X مربوط (@{twitter_username}) — المتابعة للشراء.")
 
-        # 4. التنفيذ للشراء التلقائي
+        # 4. التنفيذ للشراء التلقائي — محاولة واحدة فقط
         results = await try_buy_now_multi_wallet(slug, chain_key, detail)
 
         if results is None:
@@ -388,8 +430,9 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             broadcast_message(build_watching_message(detail, "السعر الحالي مدفوع — تحت المراقبة."))
             return
 
-        if len(successful_mints.get(slug, set())) < len(WALLETS_DATA):
-            watchlist[slug] = {"chain_key": chain_key, "detail": detail}
+        # انتهت المحاولة (نجاحًا كان أو فشلاً) — رسالة ملخص واحدة ثم الانتقال لمينت آخر (بدون إعادة محاولة لانهائية)
+        broadcast_message(build_purchase_summary_message(detail, results))
+        mark_rejected(slug)
 
     except Exception as e:
         log.error(f"خطأ بتقييم '{slug}': {e}")
@@ -434,10 +477,9 @@ async def watch_loop():
                     watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
                     continue
 
-                if len(successful_mints.get(slug, set())) >= len(WALLETS_DATA):
-                    watchlist.pop(slug, None)
-                else:
-                    watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
+                # أصبح مجانيًا الآن ونُفّذت محاولة شراء واحدة — رسالة ملخص ثم إيقاف مراقبة هذه المجموعة نهائيًا
+                watchlist.pop(slug, None)
+                broadcast_message(build_purchase_summary_message(fresh_detail, results))
 
             except Exception as e:
                 log.error(f"خطأ بدورة مراقبة '{slug}': {e}")
