@@ -218,7 +218,7 @@ def build_single_wallet_success_msg(detail: dict, result: dict, chain_key: str) 
     chain_label = "Robinhood Chain" if chain_key == "robinhood" else "Ethereum Mainnet"
     w_short = result['wallet'][:6] + "..." + result['wallet'][-4:]
     return (
-        f"✅ <b>تم الشراء بنجاح لمحافظتك!</b> ({chain_label})\n\n"
+        f"✅ <b>تم الشراء بنجاح لمحافظك!</b> ({chain_label})\n\n"
         f"المحفظة: <code>{w_short}</code>\n"
         f"المجموعة: <b>{name}</b>\n"
         f"الكمية: {result['quantity']}\n"
@@ -253,31 +253,36 @@ FAILURE_REASON_LABELS = {
 }
 
 
-def build_purchase_summary_message(detail: dict, results: list[dict]) -> str:
-    """رسالة واحدة موحّدة تلخص نتيجة محاولة الشراء لكل المحافظ، تُرسَل مرة واحدة بعد انتهاء المحاولة."""
+def build_wallet_failure_msg(detail: dict, result: dict, chain_key: str) -> str:
+    """رسالة فشل فردية لمحفظة واحدة، بنفس صيغة 'انتهت الفرصة'، تُرسل لبوت هذه المحفظة فقط."""
     name = detail.get("collection_name") or detail.get("collection_slug")
-    url = detail.get("opensea_url", "")
+    reason_key = result.get("reason")
+    reason_label = FAILURE_REASON_LABELS.get(reason_key, reason_key or "غير معروف")
+    error_detail = result.get("error")
+    if error_detail and reason_key in ("tx_error", "simulation_failed"):
+        reason_label = f"{reason_label} — {error_detail}"
+    return f"❌ <b>انتهت الفرصة</b>\n\nالمجموعة: <b>{name}</b>\nالسبب: {reason_label}"
+
+
+def build_purchase_summary_log(detail: dict, results: list[dict]) -> str:
+    """ملخص نصي (بدون HTML) لعرضه في اللوج فقط — لا يُرسَل لتيليجرام."""
+    name = detail.get("collection_name") or detail.get("collection_slug")
     total = len(results)
     successes = [r for r in results if r.get("success")]
     failures = [r for r in results if not r.get("success")]
 
-    lines = [
-        "🛒 <b>نتيجة محاولة الشراء</b>",
-        f"المجموعة: <b>{name}</b>",
-        f"النتيجة: {len(successes)} نجاح / {len(failures)} فشل (من أصل {total})",
-    ]
+    parts = [f"[{name}] نتيجة محاولة الشراء: {len(successes)} نجاح / {len(failures)} فشل (من أصل {total})"]
     if failures:
-        lines.append("\nأسباب الفشل:")
+        reasons = []
         for r in failures:
             wallet_short = (r.get("wallet") or "?")[:8]
             reason_key = r.get("reason")
             reason_label = FAILURE_REASON_LABELS.get(reason_key, reason_key or "غير معروف")
             error_detail = r.get("error")
-            extra = f" — {error_detail}" if error_detail and reason_key in ("tx_error", "simulation_failed") else ""
-            lines.append(f"• <code>{wallet_short}</code>: {reason_label}{extra}")
-    if url:
-        lines.append(f"\n🔗 {url}")
-    return "\n".join(lines)
+            extra = f" ({error_detail})" if error_detail and reason_key in ("tx_error", "simulation_failed") else ""
+            reasons.append(f"{wallet_short}={reason_label}{extra}")
+        parts.append("الأسباب: " + ", ".join(reasons))
+    return " — ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +316,10 @@ async def purchase_task_for_wallet(
             
             # إرسال إشعار النجاح فقط للبوت المربوط بهذه المحفظة
             msg = build_single_wallet_success_msg(item.get("current_detail", {}), res, item.get("chain_key", ""))
+            enqueue_message(bot_token, chat_id, msg)
+        elif res.get("reason") != "already_bought":
+            # إرسال إشعار الفشل فقط للبوت المربوط بهذه المحفظة تحديدًا
+            msg = build_wallet_failure_msg(item.get("current_detail", {}), res, item.get("chain_key", ""))
             enqueue_message(bot_token, chat_id, msg)
 
         return res
@@ -364,16 +373,6 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict) -> l
     ]
 
     results = await asyncio.gather(*tasks)
-
-    successes = [r for r in results if r.get("success")]
-    failures = [r for r in results if not r.get("success")]
-    if failures:
-        reasons_summary = ", ".join(f"{r['wallet'][:8]}={r.get('reason')}" for r in failures)
-        log.warning(
-            f"[{slug}] نتيجة محاولة الشراء: {len(successes)} نجاح / {len(failures)} فشل — "
-            f"الأسباب: {reasons_summary}"
-        )
-
     return list(results)
 
 
@@ -430,8 +429,14 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             broadcast_message(build_watching_message(detail, "السعر الحالي مدفوع — تحت المراقبة."))
             return
 
-        # انتهت المحاولة (نجاحًا كان أو فشلاً) — رسالة ملخص واحدة ثم الانتقال لمينت آخر (بدون إعادة محاولة لانهائية)
-        broadcast_message(build_purchase_summary_message(detail, results))
+        # انتهت المحاولة (نجاحًا كان أو فشلاً) — ملخص في اللوج فقط (الإشعارات الفردية أُرسلت أثناء التنفيذ لكل محفظة)
+        log.info(build_purchase_summary_log(detail, results))
+
+        # حالات فشل جماعي لا تخص محفظة بعينها (نفاد الكمية، لا عنوان عقد...) → رسالة عامة واحدة فقط
+        if results and "wallet" not in results[0]:
+            reason_label = FAILURE_REASON_LABELS.get(results[0].get("reason"), results[0].get("reason"))
+            broadcast_message(build_gaveup_message(detail, reason_label))
+
         mark_rejected(slug)
 
     except Exception as e:
@@ -477,9 +482,13 @@ async def watch_loop():
                     watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
                     continue
 
-                # أصبح مجانيًا الآن ونُفّذت محاولة شراء واحدة — رسالة ملخص ثم إيقاف مراقبة هذه المجموعة نهائيًا
+                # أصبح مجانيًا الآن ونُفّذت محاولة شراء واحدة — ملخص في اللوج فقط ثم إيقاف مراقبة هذه المجموعة نهائيًا
                 watchlist.pop(slug, None)
-                broadcast_message(build_purchase_summary_message(fresh_detail, results))
+                log.info(build_purchase_summary_log(fresh_detail, results))
+
+                if results and "wallet" not in results[0]:
+                    reason_label = FAILURE_REASON_LABELS.get(results[0].get("reason"), results[0].get("reason"))
+                    broadcast_message(build_gaveup_message(fresh_detail, reason_label))
 
             except Exception as e:
                 log.error(f"خطأ بدورة مراقبة '{slug}': {e}")
@@ -556,7 +565,7 @@ async def run():
         await telegram_sender()
         return
 
-    broadcast_message(f"✅ تم تشغيل المحفظة الخاصة بك بنجاح وم ربطها بهذا البوت!")
+    broadcast_message(f"✅ تم تشغيل المحفظة الخاصة بك بنجاح وتم ربطها بهذا البوت!")
     await asyncio.gather(listen_opensea(), watch_loop(), telegram_sender())
 
 
