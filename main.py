@@ -73,7 +73,7 @@ CHAIN_CONFIGS = {
     "robinhood": {
         "stream_chain_name": "robinhood",
         "rpc_url": f"https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY_ROBINHOOD}",
-        "max_gas_fee_usd": 0.05,
+        "max_gas_fee_usd": 0.18,
     },
     "ethereum": {
         "stream_chain_name": "ethereum",
