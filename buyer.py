@@ -11,7 +11,6 @@ from web3 import Web3
 
 log = logging.getLogger("buyer")
 
-MIN_BALANCE_RESERVE_USD = 0.10
 FEW_THRESHOLD = 20
 LIMITED_BUY_QTY = 15
 GAS_LIMIT_SAFETY_MARGIN = 1.2
@@ -50,8 +49,11 @@ def _build_selector_map() -> dict:
 SEADROP_ERROR_SELECTORS = _build_selector_map()
 
 
-def decode_web3_error(e: Exception) -> str:
-    """يحاول تحويل استثناء web3/RPC غير المقروء إلى رسالة عربية مختصرة ومفهومة."""
+def decode_web3_error(e: Exception, exclude_addresses: list[str] | None = None) -> str:
+    """يحاول تحويل استثناء web3/RPC غير المقروء إلى رسالة عربية مختصرة ومفهومة.
+    exclude_addresses: عناوين معروفة (المحفظة، عنوان العقد الهدف) يجب تجاهلها عند
+    البحث عن بيانات الرفض، لأنها قد تظهر ضمن نص الاستثناء نفسه (صدى للمعاملة المُرسلة)
+    وليست بيانات رفض حقيقية من العقد."""
     import re
 
     # الحالة 1: استثناء JSON-RPC عادي يحمل dict فيه 'message' (الأشيع لأخطاء الشبكة/الرصيد)
@@ -61,11 +63,14 @@ def decode_web3_error(e: Exception) -> str:
             return str(msg)[:200]
 
     text = str(e)
+    exclude = {a.lower() for a in (exclude_addresses or []) if a}
 
-    # الحالة 2: مطابقة أول 4 بايت من أي بيانات hex ضد أخطاء SeaDrop المعروفة
-    match = re.search(r"0x[0-9a-fA-F]{8,}", text)
-    if match:
+    # الحالة 2: مطابقة أول 4 بايت من أي بيانات hex ضد أخطاء SeaDrop المعروفة —
+    # مع تجاهل أي مطابقة تساوي عنوانًا معروفًا (محفظة/عقد) بدل بيانات رفض حقيقية
+    for match in re.finditer(r"0x[0-9a-fA-F]{8,}", text):
         hex_data = match.group(0).lower()
+        if hex_data in exclude:
+            continue
         selector = hex_data[:10]
         known = SEADROP_ERROR_SELECTORS.get(selector)
         if known:
@@ -172,6 +177,7 @@ def attempt_purchase_single_wallet(
     remaining_supply: int,
     eth_price_usd: float,
     max_gas_fee_usd: float,
+    min_balance_reserve_usd: float,
     slug: str,
     opensea_api_key: str,
 ) -> dict:
@@ -184,10 +190,10 @@ def attempt_purchase_single_wallet(
         return {"success": False, "wallet": wallet_address, "reason": "invalid_address", "error": str(e)}
 
     balance_usd = get_wallet_balance_usd(w3, checksum_wallet, eth_price_usd)
-    if balance_usd < MIN_BALANCE_RESERVE_USD:
+    if balance_usd < min_balance_reserve_usd:
         log.warning(
             f"[{slug} | {checksum_wallet[:8]}] ⏭️ رصيد غير كافٍ: "
-            f"${balance_usd:.2f} < الحد الأدنى ${MIN_BALANCE_RESERVE_USD:.2f}"
+            f"${balance_usd:.2f} < الحد الأدنى ${min_balance_reserve_usd:.2f}"
         )
         return {"success": False, "wallet": checksum_wallet, "reason": "balance_too_low", "balance_usd": balance_usd}
 
@@ -215,7 +221,12 @@ def attempt_purchase_single_wallet(
         status = mint_build.get("status")
         error_text = mint_build.get("error_text", "")
         if status == 422:
-            reason = "not_eligible_or_sold_out"
+            # "غير مؤهل للمرحلة النشطة حاليًا" رفض مؤقت — قد تصبح هذه المحفظة مؤهلة
+            # عند بدء مرحلة لاحقة، بخلاف نفاد الكمية مثلاً وهو رفض نهائي
+            if "eligible" in error_text.lower():
+                reason = "not_eligible_for_current_stage"
+            else:
+                reason = "not_eligible_or_sold_out"
         elif status == 409:
             reason = "stage_not_active"
         elif status == 429:
@@ -253,7 +264,7 @@ def attempt_purchase_single_wallet(
             estimated_gas = w3.eth.estimate_gas(tx)
             tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
         except Exception as e:
-            readable = decode_web3_error(e)
+            readable = decode_web3_error(e, exclude_addresses=[checksum_wallet, mint_build["to"]])
             log.warning(f"[{slug} | {checksum_wallet[:8]}] ⏭️ فشلت محاكاة المعاملة: {readable}")
             return {"success": False, "wallet": checksum_wallet, "reason": "simulation_failed", "error": readable}
 
@@ -288,7 +299,7 @@ def attempt_purchase_single_wallet(
         }
 
     except Exception as e:
-        readable = decode_web3_error(e)
+        readable = decode_web3_error(e, exclude_addresses=[checksum_wallet, mint_build.get("to")])
         log.error(f"[{slug} | خطأ إرسال للمحفظة {checksum_wallet[:8]}] {readable}")
         return {"success": False, "wallet": checksum_wallet, "reason": "tx_error", "error": readable}
 
