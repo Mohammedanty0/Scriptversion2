@@ -1,60 +1,22 @@
 """
-محرك الشراء التلقائي المتعدد المحافظ عبر عقد SeaDrop.
+محرك الشراء التلقائي المتعدد المحافظ.
+يبني معاملة الشراء عبر واجهة OpenSea الرسمية (POST /api/v2/drops/{slug}/mint) التي
+تختار المرحلة المؤهلة تلقائيًا (عامة أو Allowlist) وتتولى Merkle Proof بنفسها.
 """
 
 import asyncio
 import logging
+import requests
 from web3 import Web3
 
 log = logging.getLogger("buyer")
-
-SEADROP_ADDRESS = Web3.to_checksum_address("0x00005EA00Ac477B1030CE78506496e8C2dE24bf5")
-ZERO_ADDRESS = Web3.to_checksum_address("0x0000000000000000000000000000000000000000")
-
-SEADROP_ABI = [
-    {
-        "inputs": [
-            {"name": "nftContract", "type": "address"},
-            {"name": "feeRecipient", "type": "address"},
-            {"name": "minterIfNotPayer", "type": "address"},
-            {"name": "quantity", "type": "uint256"},
-        ],
-        "name": "mintPublic",
-        "outputs": [],
-        "stateMutability": "payable",
-        "type": "function",
-    },
-    {
-        "inputs": [{"name": "nftContract", "type": "address"}],
-        "name": "getAllowedFeeRecipients",
-        "outputs": [{"name": "", "type": "address[]"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [{"name": "nftContract", "type": "address"}],
-        "name": "getPublicDrop",
-        "outputs": [{
-            "components": [
-                {"name": "mintPrice", "type": "uint80"},
-                {"name": "startTime", "type": "uint48"},
-                {"name": "endTime", "type": "uint48"},
-                {"name": "maxTotalMintableByWallet", "type": "uint16"},
-                {"name": "feeBps", "type": "uint16"},
-                {"name": "restrictFeeRecipients", "type": "bool"},
-            ],
-            "name": "",
-            "type": "tuple",
-        }],
-        "stateMutability": "view",
-        "type": "function",
-    },
-]
 
 MIN_BALANCE_RESERVE_USD = 0.10
 FEW_THRESHOLD = 20
 LIMITED_BUY_QTY = 15
 GAS_LIMIT_SAFETY_MARGIN = 1.2
+FREE_PRICE_THRESHOLD_USD = 0.01
+OPENSEA_MINT_BUILD_URL = "https://api.opensea.io/api/v2/drops/{slug}/mint"
 
 # ---------------------------------------------------------------------------
 # فك ترميز أخطاء العقد (Custom Errors) بدل عرض hex خام غير مقروء
@@ -148,18 +110,43 @@ def estimate_gas_fee_usd(w3: Web3, eth_price_usd: float, gas_units: int = 150_00
         return float("inf")
 
 
-def get_fee_recipient(w3: Web3, nft_contract: str) -> str | None:
+def build_mint_tx_via_opensea(slug: str, opensea_api_key: str, minter: str, quantity: int) -> dict:
+    """
+    يطلب من OpenSea بناء معاملة شراء جاهزة للتوقيع. OpenSea تختار المرحلة المؤهلة
+    تلقائيًا (عامة أو Allowlist) لهذه المحفظة تحديدًا، وتتولى Merkle Proof بنفسها —
+    لا حاجة لأي منطق يدوي لتحديد المرحلة أو الأهلية من طرفنا.
+    """
     try:
-        seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
-        recipients = seadrop.functions.getAllowedFeeRecipients(
-            Web3.to_checksum_address(nft_contract)
-        ).call()
-        if not recipients:
-            return None
-        return Web3.to_checksum_address(recipients[0])
+        url = OPENSEA_MINT_BUILD_URL.format(slug=slug)
+        headers = {"x-api-key": opensea_api_key, "Content-Type": "application/json"}
+        resp = requests.post(url, headers=headers, json={"minter": minter, "quantity": quantity}, timeout=10)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            value_raw = str(data.get("value", "0"))
+            value_wei = int(value_raw, 16) if value_raw.lower().startswith("0x") else int(value_raw)
+            return {
+                "ok": True,
+                "to": Web3.to_checksum_address(data["to"]),
+                "data": data["data"],
+                "value": value_wei,
+            }
+
+        try:
+            errors = resp.json().get("errors", []) or []
+        except Exception:
+            errors = []
+        error_text = "; ".join(errors) if errors else resp.text[:200]
+        limit_exceeded = any("limit" in e.lower() for e in errors) or "limit" in error_text.lower()
+
+        return {
+            "ok": False,
+            "status": resp.status_code,
+            "error_text": error_text,
+            "limit_exceeded": limit_exceeded,
+        }
     except Exception as e:
-        log.error(f"[عنوان الرسوم] خطأ استعلام: {e}")
-        return None
+        return {"ok": False, "status": None, "error_text": str(e)[:200], "limit_exceeded": False}
 
 
 def decide_quantity(max_per_wallet: int | None, remaining_supply: int) -> int:
@@ -172,34 +159,21 @@ def decide_quantity(max_per_wallet: int | None, remaining_supply: int) -> int:
     return max(1, min(qty, remaining_supply))
 
 
-def get_onchain_public_price_wei(w3: Web3, nft_contract: str) -> int | None:
-    try:
-        seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
-        public_drop = seadrop.functions.getPublicDrop(
-            Web3.to_checksum_address(nft_contract)
-        ).call()
-        return int(public_drop[0])
-    except Exception as e:
-        log.warning(f"[سعر on-chain] تعذر القراءة: {e}")
-        return None
-
-
 def attempt_purchase_single_wallet(
     w3: Web3,
     private_key: str,
     wallet_address: str,
-    nft_contract: str,
-    price_wei_per_token: int,
     max_per_wallet: int | None,
     remaining_supply: int,
     eth_price_usd: float,
     max_gas_fee_usd: float,
-    slug: str = "?",
+    slug: str,
+    opensea_api_key: str,
 ) -> dict:
-    """محاولة الشراء بمحفظة واحدة محددة"""
+    """محاولة الشراء بمحفظة واحدة محددة، عبر معاملة يبنيها OpenSea (تختار المرحلة
+    المؤهلة تلقائيًا — عامة أو Allowlist — وتضمّن Merkle Proof إن لزم)."""
     try:
         checksum_wallet = Web3.to_checksum_address(wallet_address)
-        checksum_contract = Web3.to_checksum_address(nft_contract)
     except Exception as e:
         log.error(f"[{slug} | {wallet_address[:8]}] عنوان غير صالح: {e}")
         return {"success": False, "wallet": wallet_address, "reason": "invalid_address", "error": str(e)}
@@ -220,29 +194,51 @@ def attempt_purchase_single_wallet(
         )
         return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high", "gas_fee_usd": gas_fee_usd}
 
-    fee_recipient = get_fee_recipient(w3, checksum_contract)
-    if not fee_recipient:
-        log.warning(f"[{slug} | {checksum_wallet[:8]}] ⏭️ تعذر جلب fee_recipient من العقد.")
-        return {"success": False, "wallet": checksum_wallet, "reason": "no_fee_recipient"}
-
+    # طلب بناء معاملة الشراء من OpenSea — تختار المرحلة المؤهلة لهذه المحفظة تلقائيًا
     quantity = decide_quantity(max_per_wallet, remaining_supply)
-    total_value = price_wei_per_token * quantity
+    mint_build = build_mint_tx_via_opensea(slug, opensea_api_key, checksum_wallet, quantity)
+
+    if not mint_build["ok"] and mint_build.get("limit_exceeded") and quantity != 1:
+        log.info(
+            f"[{slug} | {checksum_wallet[:8]}] الكمية المطلوبة ({quantity}) تتجاوز الحد المسموح "
+            f"لهذه المحفظة — إعادة المحاولة بكمية 1."
+        )
+        quantity = 1
+        mint_build = build_mint_tx_via_opensea(slug, opensea_api_key, checksum_wallet, quantity)
+
+    if not mint_build["ok"]:
+        status = mint_build.get("status")
+        error_text = mint_build.get("error_text", "")
+        if status == 422:
+            reason = "not_eligible_or_sold_out"
+        elif status == 409:
+            reason = "stage_not_active"
+        else:
+            reason = "mint_build_failed"
+        log.warning(f"[{slug} | {checksum_wallet[:8]}] ⏭️ تعذر بناء معاملة الشراء (HTTP {status}): {error_text}")
+        return {"success": False, "wallet": checksum_wallet, "reason": reason, "error": error_text}
+
+    total_value = mint_build["value"]
+
+    # تحقق أمان أخير: المرحلة التي اختارتها OpenSea لهذه المحفظة يجب أن تكون مجانية فعلاً
+    price_usd_for_this = (total_value / 1e18) * eth_price_usd
+    if price_usd_for_this >= FREE_PRICE_THRESHOLD_USD:
+        log.warning(
+            f"[{slug} | {checksum_wallet[:8]}] ⏭️ المرحلة المؤهلة لهذه المحفظة ليست مجانية "
+            f"(${price_usd_for_this:.4f}) — تخطي."
+        )
+        return {"success": False, "wallet": checksum_wallet, "reason": "stage_not_free_for_wallet"}
 
     try:
-        contract = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
         nonce = w3.eth.get_transaction_count(checksum_wallet, "pending")
-
-        tx = contract.functions.mintPublic(
-            checksum_contract,
-            Web3.to_checksum_address(fee_recipient),
-            ZERO_ADDRESS,
-            quantity,
-        ).build_transaction({
+        tx = {
             "from": checksum_wallet,
+            "to": mint_build["to"],
+            "data": mint_build["data"],
             "value": total_value,
             "nonce": nonce,
             "chainId": w3.eth.chain_id,
-        })
+        }
 
         try:
             estimated_gas = w3.eth.estimate_gas(tx)
