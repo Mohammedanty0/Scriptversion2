@@ -255,6 +255,7 @@ FAILURE_REASON_LABELS = {
     "not_eligible_or_sold_out": "هذه المحفظة غير مؤهلة لأي مرحلة حاليًا (أو نفدت الكمية)",
     "stage_not_active": "لا توجد مرحلة نشطة حاليًا لهذا العقد",
     "mint_build_failed": "تعذر بناء معاملة الشراء عبر OpenSea",
+    "rate_limited": "تجاوزنا حد طلبات OpenSea (Rate Limit) لحظيًا",
     "stage_not_free_for_wallet": "المرحلة المؤهلة لهذه المحفظة ليست مجانية",
 }
 
