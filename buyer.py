@@ -137,7 +137,12 @@ def build_mint_tx_via_opensea(slug: str, opensea_api_key: str, minter: str, quan
         except Exception:
             errors = []
         error_text = "; ".join(errors) if errors else resp.text[:200]
-        limit_exceeded = any("limit" in e.lower() for e in errors) or "limit" in error_text.lower()
+
+        # "تجاوز الكمية المسموحة" لا يُكتشف إلا من رد 422 تحديدًا، وإلا فكلمة "limit"
+        # قد تظهر أيضًا في رسائل Rate Limit (429) وتُخلط بينهما خطأً
+        limit_exceeded = resp.status_code == 422 and (
+            any("limit" in e.lower() for e in errors) or "limit" in error_text.lower()
+        )
 
         return {
             "ok": False,
@@ -213,6 +218,8 @@ def attempt_purchase_single_wallet(
             reason = "not_eligible_or_sold_out"
         elif status == 409:
             reason = "stage_not_active"
+        elif status == 429:
+            reason = "rate_limited"
         else:
             reason = "mint_build_failed"
         log.warning(f"[{slug} | {checksum_wallet[:8]}] ⏭️ تعذر بناء معاملة الشراء (HTTP {status}): {error_text}")
@@ -231,6 +238,7 @@ def attempt_purchase_single_wallet(
 
     try:
         nonce = w3.eth.get_transaction_count(checksum_wallet, "pending")
+        gas_price = w3.eth.gas_price
         tx = {
             "from": checksum_wallet,
             "to": mint_build["to"],
@@ -238,6 +246,7 @@ def attempt_purchase_single_wallet(
             "value": total_value,
             "nonce": nonce,
             "chainId": w3.eth.chain_id,
+            "gasPrice": gas_price,
         }
 
         try:
@@ -248,7 +257,7 @@ def attempt_purchase_single_wallet(
             log.warning(f"[{slug} | {checksum_wallet[:8]}] ⏭️ فشلت محاكاة المعاملة: {readable}")
             return {"success": False, "wallet": checksum_wallet, "reason": "simulation_failed", "error": readable}
 
-        actual_gas_fee_usd = (tx["gas"] * w3.eth.gas_price / 1e18) * eth_price_usd
+        actual_gas_fee_usd = (tx["gas"] * gas_price / 1e18) * eth_price_usd
         if actual_gas_fee_usd > max_gas_fee_usd:
             log.warning(
                 f"[{slug} | {checksum_wallet[:8]}] ⏭️ رسوم الغاز مرتفعة (بعد المحاكاة): "
@@ -256,7 +265,7 @@ def attempt_purchase_single_wallet(
             )
             return {"success": False, "wallet": checksum_wallet, "reason": "gas_too_high", "gas_fee_usd": actual_gas_fee_usd}
 
-        total_cost_wei = total_value + (tx["gas"] * w3.eth.gas_price)
+        total_cost_wei = total_value + (tx["gas"] * gas_price)
         wallet_balance_wei = w3.eth.get_balance(checksum_wallet)
         if wallet_balance_wei < total_cost_wei:
             log.warning(
