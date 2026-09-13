@@ -73,11 +73,13 @@ CHAIN_CONFIGS = {
         "stream_chain_name": "robinhood",
         "rpc_url": f"https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY_ROBINHOOD}",
         "max_gas_fee_usd": 0.18,
+        "min_balance_reserve_usd": 0.02,
     },
     "ethereum": {
         "stream_chain_name": "ethereum",
         "rpc_url": f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY_ETHEREUM}",
         "max_gas_fee_usd": 0.50,
+        "min_balance_reserve_usd": 0.10,
     },
 }
 
@@ -253,6 +255,7 @@ FAILURE_REASON_LABELS = {
     "no_contract_address": "لا يوجد عنوان عقد لهذه المجموعة",
     "all_wallets_completed": "كل المحافظ اشترت مسبقًا",
     "not_eligible_or_sold_out": "هذه المحفظة غير مؤهلة لأي مرحلة حاليًا (أو نفدت الكمية)",
+    "not_eligible_for_current_stage": "غير مؤهل للمرحلة النشطة حاليًا (قد تصبح مؤهلاً في مرحلة لاحقة)",
     "stage_not_active": "لا توجد مرحلة نشطة حاليًا لهذا العقد",
     "mint_build_failed": "تعذر بناء معاملة الشراء عبر OpenSea",
     "rate_limited": "تجاوزنا حد طلبات OpenSea (Rate Limit) لحظيًا",
@@ -297,7 +300,7 @@ def build_purchase_summary_log(detail: dict, results: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 async def purchase_task_for_wallet(
-    w3, item, slug, max_per_wallet, remaining, eth_price_usd, max_gas_fee_usd
+    w3, item, slug, max_per_wallet, remaining, eth_price_usd, max_gas_fee_usd, min_balance_reserve_usd
 ):
     wallet_addr = item["wallet"]
     pk = item["private_key"]
@@ -313,7 +316,7 @@ async def purchase_task_for_wallet(
             attempt_purchase_single_wallet,
             w3, pk, wallet_addr,
             max_per_wallet, remaining,
-            eth_price_usd, max_gas_fee_usd, slug, OPENSEA_API_KEY,
+            eth_price_usd, max_gas_fee_usd, min_balance_reserve_usd, slug, OPENSEA_API_KEY,
         )
 
         if res.get("success"):
@@ -324,7 +327,7 @@ async def purchase_task_for_wallet(
             # إرسال إشعار النجاح فقط للبوت المربوط بهذه المحفظة
             msg = build_single_wallet_success_msg(item.get("current_detail", {}), res, item.get("chain_key", ""))
             enqueue_message(bot_token, chat_id, msg)
-        elif res.get("reason") != "already_bought":
+        elif res.get("reason") not in ("already_bought", "not_eligible_for_current_stage"):
             # إرسال إشعار الفشل فقط للبوت المربوط بهذه المحفظة تحديدًا
             msg = build_wallet_failure_msg(item.get("current_detail", {}), res, item.get("chain_key", ""))
             enqueue_message(bot_token, chat_id, msg)
@@ -357,6 +360,7 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict) -> l
     max_per_wallet_raw = stage.get("max_total_mintable_by_wallet") or stage.get("max_per_wallet")
     max_per_wallet = int(max_per_wallet_raw) if max_per_wallet_raw is not None else None
     max_gas_fee_usd = CHAIN_CONFIGS[chain_key]["max_gas_fee_usd"]
+    min_balance_reserve_usd = CHAIN_CONFIGS[chain_key]["min_balance_reserve_usd"]
 
     already_bought_wallets = successful_mints.get(slug, set())
     pending_items = [item for item in WALLETS_DATA if item["wallet"] not in already_bought_wallets]
@@ -371,7 +375,7 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict) -> l
 
     tasks = [
         purchase_task_for_wallet(
-            w3, item, slug, max_per_wallet, remaining, eth_price_usd, max_gas_fee_usd
+            w3, item, slug, max_per_wallet, remaining, eth_price_usd, max_gas_fee_usd, min_balance_reserve_usd
         )
         for item in pending_items
     ]
@@ -430,7 +434,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             broadcast_message(build_watching_message(detail, "السعر الحالي مدفوع — تحت المراقبة."))
             return
 
-        # انتهت المحاولة (نجاحًا كان أو فشلاً) — ملخص في اللوج فقط (الإشعارات الفردية أُرسلت أثناء التنفيذ لكل محفظة)
+        # انتهت المحاولة — ملخص في اللوج فقط (الإشعارات الفردية أُرسلت أثناء التنفيذ لكل محفظة)
         log.info(build_purchase_summary_log(detail, results))
 
         # حالات فشل جماعي لا تخص محفظة بعينها (نفاد الكمية، لا عنوان عقد...) → رسالة عامة واحدة فقط
@@ -438,11 +442,76 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             reason_label = FAILURE_REASON_LABELS.get(results[0].get("reason"), results[0].get("reason"))
             broadcast_message(build_gaveup_message(detail, reason_label))
 
-        # محاولة شراء حقيقية تمت فعلاً — لا نعيد المحاولة لهذه المجموعة أبدًا مهما تكررت أحداث المينت لها
-        attempted_slugs.add(slug)
+        # لو أي محفظة رُفضت لأنها "غير مؤهلة للمرحلة النشطة حاليًا" تحديدًا (وليس نفاد كمية أو سبب آخر)،
+        # فهذا رفض مؤقت — قد تصبح مؤهلة عند بدء مرحلة لاحقة (Allowlist أخرى أو Public)، فنُبقي المجموعة
+        # تحت المراقبة بدل اعتبارها منتهية نهائيًا
+        stage_pending = any(
+            r.get("reason") == "not_eligible_for_current_stage" for r in results if "wallet" in r
+        )
+        if stage_pending:
+            watchlist[slug] = {"chain_key": chain_key, "detail": detail}
+        else:
+            # محاولة شراء حقيقية ونهائية — لا نعيد المحاولة لهذه المجموعة أبدًا بعد الآن
+            attempted_slugs.add(slug)
 
     except Exception as e:
         log.error(f"خطأ بتقييم '{slug}': {e}")
+    finally:
+        in_flight.discard(slug)
+
+
+async def process_watchlist_slug(slug: str):
+    """فحص عنصر واحد من watchlist. مصممة لتُشغَّل بالتوازي مع بقية العناصر عبر asyncio.gather —
+    أي استثناء يُلتقط داخليًا هنا فقط، حتى لا يوقف gather بقية المهام المتوازية الأخرى."""
+    if slug in in_flight or len(successful_mints.get(slug, set())) >= len(WALLETS_DATA):
+        watchlist.pop(slug, None)
+        return
+
+    entry = watchlist.get(slug)
+    if not entry:
+        return
+
+    in_flight.add(slug)
+    try:
+        chain_key = entry["chain_key"]
+        found, fresh_detail = await asyncio.to_thread(fetch_drop_detail, slug)
+
+        if not found or not fresh_detail or not fresh_detail.get("is_minting"):
+            watchlist.pop(slug, None)
+            broadcast_message(build_gaveup_message(entry["detail"], "المينت لم يعد نشطًا."))
+            return
+
+        stage = fresh_detail.get("active_stage")
+        if not stage or (stage_has_ended(stage) and not fresh_detail.get("next_stage")):
+            watchlist.pop(slug, None)
+            broadcast_message(build_gaveup_message(fresh_detail, "انتهت المرحلة."))
+            return
+
+        results = await try_buy_now_multi_wallet(slug, chain_key, fresh_detail)
+
+        if results is None:
+            watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
+            return
+
+        # ملخص في اللوج فقط (الإشعارات الفردية أُرسلت أثناء التنفيذ لكل محفظة)
+        log.info(build_purchase_summary_log(fresh_detail, results))
+
+        if results and "wallet" not in results[0]:
+            reason_label = FAILURE_REASON_LABELS.get(results[0].get("reason"), results[0].get("reason"))
+            broadcast_message(build_gaveup_message(fresh_detail, reason_label))
+
+        # نفس منطق evaluate_new_mint: رفض "غير مؤهل للمرحلة الحالية" مؤقت، نستمر بالمراقبة
+        stage_pending = any(
+            r.get("reason") == "not_eligible_for_current_stage" for r in results if "wallet" in r
+        )
+        if stage_pending:
+            watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
+        else:
+            watchlist.pop(slug, None)
+            attempted_slugs.add(slug)
+
+    except Exception as e:
+        log.error(f"خطأ بدورة مراقبة '{slug}': {e}")
     finally:
         in_flight.discard(slug)
 
@@ -453,50 +522,10 @@ async def watch_loop():
         if not watchlist:
             continue
 
-        for slug in list(watchlist.keys()):
-            if slug in in_flight or len(successful_mints.get(slug, set())) >= len(WALLETS_DATA):
-                watchlist.pop(slug, None)
-                continue
-
-            entry = watchlist.get(slug)
-            if not entry:
-                continue
-
-            in_flight.add(slug)
-            try:
-                chain_key = entry["chain_key"]
-                found, fresh_detail = await asyncio.to_thread(fetch_drop_detail, slug)
-
-                if not found or not fresh_detail or not fresh_detail.get("is_minting"):
-                    watchlist.pop(slug, None)
-                    broadcast_message(build_gaveup_message(entry["detail"], "المينت لم يعد نشطًا."))
-                    continue
-
-                stage = fresh_detail.get("active_stage")
-                if not stage or (stage_has_ended(stage) and not fresh_detail.get("next_stage")):
-                    watchlist.pop(slug, None)
-                    broadcast_message(build_gaveup_message(fresh_detail, "انتهت المرحلة."))
-                    continue
-
-                results = await try_buy_now_multi_wallet(slug, chain_key, fresh_detail)
-
-                if results is None:
-                    watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
-                    continue
-
-                # أصبح مجانيًا الآن ونُفّذت محاولة شراء واحدة — ملخص في اللوج فقط ثم إيقاف مراقبة هذه المجموعة نهائيًا
-                watchlist.pop(slug, None)
-                attempted_slugs.add(slug)
-                log.info(build_purchase_summary_log(fresh_detail, results))
-
-                if results and "wallet" not in results[0]:
-                    reason_label = FAILURE_REASON_LABELS.get(results[0].get("reason"), results[0].get("reason"))
-                    broadcast_message(build_gaveup_message(fresh_detail, reason_label))
-
-            except Exception as e:
-                log.error(f"خطأ بدورة مراقبة '{slug}': {e}")
-            finally:
-                in_flight.discard(slug)
+        # نأخذ لقطة من المفاتيح الحالية، ثم نفحص كل العناصر بالتوازي بدل التسلسل —
+        # فحص 30 مينتًا تحت المراقبة يستغرق تقريبًا نفس وقت فحص مينت واحد، وليس 30 ضعفًا
+        slugs_snapshot = list(watchlist.keys())
+        await asyncio.gather(*(process_watchlist_slug(slug) for slug in slugs_snapshot))
 
 
 async def listen_opensea():
