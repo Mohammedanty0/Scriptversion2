@@ -19,7 +19,6 @@ from dotenv import load_dotenv
 from buyer import (
     get_web3,
     attempt_purchase_single_wallet,
-    get_onchain_public_price_wei,
     get_wallet_lock,
 )
 from twitter_checker import get_twitter_username_from_opensea
@@ -94,6 +93,10 @@ in_flight: set[str] = set()
 # مع كل حدث "مينت جديد" من نفس المجموعة (قد يصل عشرات المرات بالثانية)
 REJECTION_COOLDOWN_SECONDS = 120
 rejected_cooldown: dict[str, float] = {}
+
+# مجموعات تمت محاولة الشراء الفعلي منها مرة واحدة (نجاحًا أو فشلاً) — لا تُعاد أبدًا،
+# بخلاف رفض التبريد المؤقت أعلاه الذي يخص فقط حالات ما قبل الشراء (غير مجاني / لا حساب X)
+attempted_slugs: set[str] = set()
 
 
 def is_in_cooldown(slug: str) -> bool:
@@ -218,7 +221,7 @@ def build_single_wallet_success_msg(detail: dict, result: dict, chain_key: str) 
     chain_label = "Robinhood Chain" if chain_key == "robinhood" else "Ethereum Mainnet"
     w_short = result['wallet'][:6] + "..." + result['wallet'][-4:]
     return (
-        f"✅ <b>تم الشراء بنجاح لمحافظك!</b> ({chain_label})\n\n"
+        f"✅ <b>تم الشراء بنجاح لمحافظتك!</b> ({chain_label})\n\n"
         f"المحفظة: <code>{w_short}</code>\n"
         f"المجموعة: <b>{name}</b>\n"
         f"الكمية: {result['quantity']}\n"
@@ -241,7 +244,6 @@ def build_gaveup_message(detail: dict, reason: str) -> str:
 FAILURE_REASON_LABELS = {
     "balance_too_low": "رصيد غير كافٍ",
     "gas_too_high": "رسوم الغاز أعلى من الحد المسموح",
-    "no_fee_recipient": "تعذر جلب عنوان الرسوم من العقد",
     "simulation_failed": "رفضت محاكاة المعاملة",
     "insufficient_funds_for_total_cost": "الرصيد لا يغطي (السعر + الغاز)",
     "tx_error": "خطأ عند إرسال المعاملة",
@@ -250,6 +252,10 @@ FAILURE_REASON_LABELS = {
     "sold_out": "نفدت الكمية",
     "no_contract_address": "لا يوجد عنوان عقد لهذه المجموعة",
     "all_wallets_completed": "كل المحافظ اشترت مسبقًا",
+    "not_eligible_or_sold_out": "هذه المحفظة غير مؤهلة لأي مرحلة حاليًا (أو نفدت الكمية)",
+    "stage_not_active": "لا توجد مرحلة نشطة حاليًا لهذا العقد",
+    "mint_build_failed": "تعذر بناء معاملة الشراء عبر OpenSea",
+    "stage_not_free_for_wallet": "المرحلة المؤهلة لهذه المحفظة ليست مجانية",
 }
 
 
@@ -290,7 +296,7 @@ def build_purchase_summary_log(detail: dict, results: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 async def purchase_task_for_wallet(
-    w3, item, slug, contract_address, price_wei, max_per_wallet, remaining, eth_price_usd, max_gas_fee_usd
+    w3, item, slug, max_per_wallet, remaining, eth_price_usd, max_gas_fee_usd
 ):
     wallet_addr = item["wallet"]
     pk = item["private_key"]
@@ -305,8 +311,8 @@ async def purchase_task_for_wallet(
         res = await asyncio.to_thread(
             attempt_purchase_single_wallet,
             w3, pk, wallet_addr,
-            contract_address, price_wei, max_per_wallet, remaining,
-            eth_price_usd, max_gas_fee_usd, slug,
+            max_per_wallet, remaining,
+            eth_price_usd, max_gas_fee_usd, slug, OPENSEA_API_KEY,
         )
 
         if res.get("success"):
@@ -343,10 +349,8 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict) -> l
     w3 = W3_INSTANCES[chain_key]
     eth_price_usd = get_eth_price_usd()
 
-    onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
-    price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
-
-    if not is_free_or_negligible(price_wei, eth_price_usd):
+    stage_price_wei = int(stage.get("price") or 0)
+    if not is_free_or_negligible(stage_price_wei, eth_price_usd):
         return None  # مدفوع -> للمراقبة
 
     max_per_wallet_raw = stage.get("max_total_mintable_by_wallet") or stage.get("max_per_wallet")
@@ -366,8 +370,7 @@ async def try_buy_now_multi_wallet(slug: str, chain_key: str, detail: dict) -> l
 
     tasks = [
         purchase_task_for_wallet(
-            w3, item, slug, contract_address,
-            price_wei, max_per_wallet, remaining, eth_price_usd, max_gas_fee_usd
+            w3, item, slug, max_per_wallet, remaining, eth_price_usd, max_gas_fee_usd
         )
         for item in pending_items
     ]
@@ -385,6 +388,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         len(successful_mints.get(slug, set())) >= len(WALLETS_DATA)
         or slug in watchlist
         or slug in in_flight
+        or slug in attempted_slugs
         or is_in_cooldown(slug)
     ):
         return
@@ -400,17 +404,13 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if not stage or not started_today_local(stage):
             return
 
-        # 2. التأكد من أن المينت مجاني قبل فحص تويتر لتوفير API Requests
-        w3 = W3_INSTANCES[chain_key]
+        # 2. تحقق أولي سريع: هل السعر المعلن لهذه المرحلة (أيًا كان نوعها: عامة أو Allowlist) مجاني؟
+        # ملاحظة: الفحص النهائي الدقيق لكل محفظة يتم لاحقًا عبر OpenSea نفسها في مرحلة الشراء.
         eth_price_usd = get_eth_price_usd()
-        contract_address = detail.get("contract_address")
-        
-        if contract_address:
-            onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
-            price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
-            
-            if not is_free_or_negligible(price_wei, eth_price_usd):
-                return  # يتجاهل المدفوع فوراً (لا حاجة لتبريد، دورة المراقبة تتكفل به لو أُضيف لاحقًا)
+        stage_price_wei = int(stage.get("price") or 0)
+
+        if not is_free_or_negligible(stage_price_wei, eth_price_usd):
+            return  # يتجاهل المدفوع فوراً (لا حاجة لتبريد، دورة المراقبة تتكفل به لو أُضيف لاحقًا)
 
         # 3. الفحص عبر X: يكفي وجود حساب X مربوط بالمجموعة (دون فحص التوثيق أو المتابعين)
         twitter_username = await asyncio.to_thread(get_twitter_username_from_opensea, slug, OPENSEA_API_KEY)
@@ -437,7 +437,8 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             reason_label = FAILURE_REASON_LABELS.get(results[0].get("reason"), results[0].get("reason"))
             broadcast_message(build_gaveup_message(detail, reason_label))
 
-        mark_rejected(slug)
+        # محاولة شراء حقيقية تمت فعلاً — لا نعيد المحاولة لهذه المجموعة أبدًا مهما تكررت أحداث المينت لها
+        attempted_slugs.add(slug)
 
     except Exception as e:
         log.error(f"خطأ بتقييم '{slug}': {e}")
@@ -484,6 +485,7 @@ async def watch_loop():
 
                 # أصبح مجانيًا الآن ونُفّذت محاولة شراء واحدة — ملخص في اللوج فقط ثم إيقاف مراقبة هذه المجموعة نهائيًا
                 watchlist.pop(slug, None)
+                attempted_slugs.add(slug)
                 log.info(build_purchase_summary_log(fresh_detail, results))
 
                 if results and "wallet" not in results[0]:
@@ -552,7 +554,7 @@ async def listen_opensea():
 
         except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
             log.warning(f"انقطع الاتصال ({e}). إعادة الاتصال...")
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
         except Exception as e:
             log.error(f"خطأ غير متوقع: {e}.")
             await asyncio.sleep(5)
@@ -565,7 +567,7 @@ async def run():
         await telegram_sender()
         return
 
-    broadcast_message(f"✅ تم تشغيل المحفظة الخاصة بك بنجاح وتم ربطها بهذا البوت!")
+    broadcast_message(f"✅ تم تشغيل المحفظة الخاصة بك بنجاح وم ربطها بهذا البوت!")
     await asyncio.gather(listen_opensea(), watch_loop(), telegram_sender())
 
 
