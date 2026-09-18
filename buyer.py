@@ -6,6 +6,7 @@
 
 import asyncio
 import logging
+import threading
 import requests
 from web3 import Web3
 
@@ -16,6 +17,12 @@ LIMITED_BUY_QTY = 15
 GAS_LIMIT_SAFETY_MARGIN = 1.2
 FREE_PRICE_THRESHOLD_USD = 0.01
 OPENSEA_MINT_BUILD_URL = "https://api.opensea.io/api/v2/drops/{slug}/mint"
+
+# دالة بناء المعاملة تُستدعى من داخل asyncio.to_thread (أي من خيوط تشغيل منفصلة)،
+# لذا نستخدم threading.Semaphore (وليس asyncio.Semaphore غير الآمن عبر الخيوط) للحد
+# من عدد الطلبات المتزامنة لواجهة OpenSea، لتفادي 429 Rate Limit عند تزاحم عدة مينتات
+OPENSEA_MAX_CONCURRENT_REQUESTS = 5
+_opensea_semaphore = threading.Semaphore(OPENSEA_MAX_CONCURRENT_REQUESTS)
 
 # ---------------------------------------------------------------------------
 # فك ترميز أخطاء العقد (Custom Errors) بدل عرض hex خام غير مقروء
@@ -124,7 +131,8 @@ def build_mint_tx_via_opensea(slug: str, opensea_api_key: str, minter: str, quan
     try:
         url = OPENSEA_MINT_BUILD_URL.format(slug=slug)
         headers = {"x-api-key": opensea_api_key, "Content-Type": "application/json"}
-        resp = requests.post(url, headers=headers, json={"minter": minter, "quantity": quantity}, timeout=10)
+        with _opensea_semaphore:
+            resp = requests.post(url, headers=headers, json={"minter": minter, "quantity": quantity}, timeout=10)
 
         if resp.status_code == 200:
             data = resp.json()
