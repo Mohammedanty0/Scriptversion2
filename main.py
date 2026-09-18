@@ -262,6 +262,10 @@ FAILURE_REASON_LABELS = {
     "stage_not_free_for_wallet": "المرحلة المؤهلة لهذه المحفظة ليست مجانية",
 }
 
+# أسباب رفض مؤقتة — قد تتغيّر النتيجة لاحقًا (مرحلة جديدة تبدأ، أو زوال الازدحام على OpenSea)،
+# فتبقى المجموعة تحت المراقبة بدل اعتبارها منتهية نهائيًا، ولا تُرسَل إشعارات فشل فردية متكررة لها
+TRANSIENT_FAILURE_REASONS = ("not_eligible_for_current_stage", "rate_limited")
+
 
 def build_wallet_failure_msg(detail: dict, result: dict, chain_key: str) -> str:
     """رسالة فشل فردية لمحفظة واحدة، بنفس صيغة 'انتهت الفرصة'، تُرسل لبوت هذه المحفظة فقط."""
@@ -327,7 +331,7 @@ async def purchase_task_for_wallet(
             # إرسال إشعار النجاح فقط للبوت المربوط بهذه المحفظة
             msg = build_single_wallet_success_msg(item.get("current_detail", {}), res, item.get("chain_key", ""))
             enqueue_message(bot_token, chat_id, msg)
-        elif res.get("reason") not in ("already_bought", "not_eligible_for_current_stage"):
+        elif res.get("reason") not in (("already_bought",) + TRANSIENT_FAILURE_REASONS):
             # إرسال إشعار الفشل فقط للبوت المربوط بهذه المحفظة تحديدًا
             msg = build_wallet_failure_msg(item.get("current_detail", {}), res, item.get("chain_key", ""))
             enqueue_message(bot_token, chat_id, msg)
@@ -442,11 +446,10 @@ async def evaluate_new_mint(slug: str, chain_key: str):
             reason_label = FAILURE_REASON_LABELS.get(results[0].get("reason"), results[0].get("reason"))
             broadcast_message(build_gaveup_message(detail, reason_label))
 
-        # لو أي محفظة رُفضت لأنها "غير مؤهلة للمرحلة النشطة حاليًا" تحديدًا (وليس نفاد كمية أو سبب آخر)،
-        # فهذا رفض مؤقت — قد تصبح مؤهلة عند بدء مرحلة لاحقة (Allowlist أخرى أو Public)، فنُبقي المجموعة
-        # تحت المراقبة بدل اعتبارها منتهية نهائيًا
+        # لو أي محفظة رُفضت لسبب مؤقت (غير مؤهلة للمرحلة الحالية، أو ازدحام مؤقت على OpenSea)،
+        # فقد تتغيّر النتيجة لاحقًا، فنُبقي المجموعة تحت المراقبة بدل اعتبارها منتهية نهائيًا
         stage_pending = any(
-            r.get("reason") == "not_eligible_for_current_stage" for r in results if "wallet" in r
+            r.get("reason") in TRANSIENT_FAILURE_REASONS for r in results if "wallet" in r
         )
         if stage_pending:
             watchlist[slug] = {"chain_key": chain_key, "detail": detail}
@@ -500,9 +503,9 @@ async def process_watchlist_slug(slug: str):
             reason_label = FAILURE_REASON_LABELS.get(results[0].get("reason"), results[0].get("reason"))
             broadcast_message(build_gaveup_message(fresh_detail, reason_label))
 
-        # نفس منطق evaluate_new_mint: رفض "غير مؤهل للمرحلة الحالية" مؤقت، نستمر بالمراقبة
+        # نفس منطق evaluate_new_mint: الأسباب المؤقتة تُبقي المراقبة مستمرة
         stage_pending = any(
-            r.get("reason") == "not_eligible_for_current_stage" for r in results if "wallet" in r
+            r.get("reason") in TRANSIENT_FAILURE_REASONS for r in results if "wallet" in r
         )
         if stage_pending:
             watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}
